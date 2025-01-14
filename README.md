@@ -1,109 +1,74 @@
 #include <WiFi.h>
-#include <HTTPClient.h>
-#include <SoftwareSerial.h>
-#include <PMS.h>
-
-// WiFi Credentials
-const char* ssid = "Your_SSID";           // ใส่ชื่อ WiFi ของคุณ
-const char* password = "Your_PASSWORD";   // ใส่รหัสผ่าน WiFi
-
-// LINE Notify Token
-String lineToken = "Your_LINE_Token";     // ใส่ LINE Notify Token
-
-// PMS7003 Pin Configuration
-#define PMS_RX 16  // ESP32 GPIO RX (เชื่อมกับ TX ของ PMS7003)
-#define PMS_TX 17  // ESP32 GPIO TX (เชื่อมกับ RX ของ PMS7003)
-
-// Smoke Sensor Pin (MQ-2 or MQ-7)
-#define SMOKE_SENSOR_PIN 34 // ขา Analog สำหรับเซ็นเซอร์ควัน
-
-// Buzzer Pin
-#define BUZZER_PIN 26 // ขา Digital สำหรับ Buzzer
-
-// PMS7003 Object
-SoftwareSerial pmsSerial(PMS_RX, PMS_TX); // กำหนดขาสำหรับ PMS7003
-PMS pms(pmsSerial);
-PMS::DATA data;
-
-// ค่าแจ้งเตือน PM2.5 และ ควัน (ปรับได้)
-const int PM25_ALERT_THRESHOLD = 50; // µg/m³
-const int SMOKE_ALERT_THRESHOLD = 300; // ค่า Analog Sensor (0-1023)
-
+#include <ThingSpeak.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <HardwareSerial.h>
+// Wi-Fi Credentials
+const char* ssid = "YOUR_WIFI_SSID";      // ชื่อ Wi-Fi
+const char* password = "YOUR_WIFI_PASSWORD"; // รหัสผ่าน Wi-Fi
+// ThingSpeak Settings
+const char* server = "api.thingspeak.com";
+unsigned long channelID = YOUR_CHANNEL_ID; // Channel ID ของคุณ
+const char* writeAPIKey = "YOUR_WRITE_API_KEY"; // Write API Key ของคุณ
+// LCD และ PMS7003
+LiquidCrystal_I2C lcd(0x27, 16, 2); // ที่อยู่ I2C ของ LCD
+HardwareSerial pmsSerial(2);       // PMS7003 TX=16, RX=17
+WiFiClient client;
 void setup() {
-  Serial.begin(115200); // เปิด Serial Monitor
-  pmsSerial.begin(9600); // ตั้งค่า Serial สำหรับ PMS7003
-
-  // กำหนด Buzzer Pin เป็น Output
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW); // ปิดเสียงเริ่มต้น
-
+  // เริ่มต้น LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0);
+  lcd.print("Connecting WiFi");
+﻿
+  // เริ่มต้น PMS7003
+  pmsSerial.begin(9600, SERIAL_8N1, 16, 17);
+  Serial.begin(115200);
   // เชื่อมต่อ Wi-Fi
-  Serial.print("Connecting to WiFi");
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(1000);
-    Serial.print(".");
+    Serial.println("Connecting to WiFi...");
+    lcd.setCursor(0, 1);
+    lcd.print(".");
   }
-  Serial.println("\nWiFi Connected!");
+  lcd.clear();
+  lcd.print("WiFi Connected");
+  // เริ่มต้น ThingSpeak
+  ThingSpeak.begin(client);
 }
-
-void sendLineNotify(String message) {
-  if (WiFi.status() == WL_CONNECTED) { // เช็คว่า Wi-Fi เชื่อมต่ออยู่หรือไม่
-    HTTPClient http;
-    http.begin("https://notify-api.line.me/api/notify"); // URL สำหรับ LINE Notify
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    http.addHeader("Authorization", "Bearer " + lineToken);
-    int httpResponseCode = http.POST("message=" + message);
-
-    if (httpResponseCode > 0) {
-      Serial.println("LINE Notify Sent! Response: " + String(httpResponseCode));
-    } else {
-      Serial.println("Error sending LINE Notify: " + String(httpResponseCode));
-    }
-    http.end();
-  } else {
-    Serial.println("WiFi Disconnected. Cannot send LINE Notify.");
-  }
-}
-
-void alertBuzzer(int duration) {
-  digitalWrite(BUZZER_PIN, HIGH); // เปิดเสียง Buzzer
-  delay(duration);
-  digitalWrite(BUZZER_PIN, LOW);  // ปิดเสียง Buzzer
-}
-
 void loop() {
-  // อ่านค่าฝุ่นจาก PMS7003
-  if (pms.readUntil(data)) {
-    Serial.println("------ PM Values ------");
-    Serial.print("PM1.0: "); Serial.print(data.PM_AE_UG_1_0); Serial.println(" µg/m³");
-    Serial.print("PM2.5: "); Serial.print(data.PM_AE_UG_2_5); Serial.println(" µg/m³");
-    Serial.print("PM10: "); Serial.print(data.PM_AE_UG_10_0); Serial.println(" µg/m³");
-
-    // แจ้งเตือนถ้าค่า PM2.5 เกินเกณฑ์
-    if (data.PM_AE_UG_2_5 > PM25_ALERT_THRESHOLD) {
-      String message = "⚠️ ค่าฝุ่น PM2.5 สูงเกินมาตรฐาน! (" + String(data.PM_AE_UG_2_5) + " µg/m³)";
-      sendLineNotify(message);
-      delay(60000); // เว้นการแจ้งเตือน 1 นาที
+  if (pmsSerial.available() >= 32) { // PMS7003 ส่งข้อมูล 32 ไบต์
+    byte buffer[32];
+    pmsSerial.readBytes(buffer, 32);
+    if (buffer[0] == 0x42 && buffer[1] == 0x4D) { // ตรวจสอบ Header
+      int pm2_5 = (buffer[12] << 8) + buffer[13]; // ค่า PM2.5
+      int pm10 = (buffer[14] << 8) + buffer[15];  // ค่า PM10
+﻿
+      // แสดงผลบน LCD
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("PM2.5: ");
+      lcd.print(pm2_5);
+      lcd.print(" ug/m3");
+      lcd.setCursor(0, 1);
+      lcd.print("PM10: ");
+      lcd.print(pm10);
+      lcd.print(" ug/m3");
+﻿
+      // ส่งค่าขึ้น ThingSpeak
+      ThingSpeak.setField(1, pm2_5); // Field 1: PM2.5
+      ThingSpeak.setField(2, pm10);  // Field 2: PM10
+      int responseCode = ThingSpeak.writeFields(channelID, writeAPIKey);
+      // ตรวจสอบการส่งข้อมูล
+      if (responseCode == 200) {
+        Serial.println("Update successful");
+      } else {
+        Serial.print("Update failed, code: ");
+        Serial.println(responseCode);
+      }
+      delay(15000); // ThingSpeak จำกัดการส่งข้อมูลทุก 15 วินาที
     }
   }
-
-  // อ่านค่าควันจาก MQ-2
-  int smokeValue = analogRead(SMOKE_SENSOR_PIN);
-  Serial.print("Smoke Sensor Value: ");
-  Serial.println(smokeValue);
-
-  // แจ้งเตือนถ้าค่าควันเกินเกณฑ์
-  if (smokeValue > SMOKE_ALERT_THRESHOLD) {
-    String message = "⚠️ ควันสูงเกินมาตรฐาน! (" + String(smokeValue) + ")";
-    sendLineNotify(message);
-
-    // เปิดเสียงแจ้งเตือน
-    alertBuzzer(1000); // เปิดเสียงเป็นเวลา 1 วินาที
-    delay(4000);       // พักเสียง 4 วินาที (รวมเป็น 5 วินาที)
-
-    delay(60000); // เว้นการแจ้งเตือน 1 นาที
-  }
-
-  delay(5000); // อ่านค่าทุก 5 วินาที
 }
+﻿
